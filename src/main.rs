@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, VecDeque, HashMap};
 use uuid::Uuid;
+use rand::Rng;
 
 #[derive(Debug)]
 pub enum Side {
@@ -13,6 +14,34 @@ pub enum OrderStatus {
     Created, 
     Filled, 
     PartiallyFilled, 
+}
+
+#[derive(Debug)]
+pub struct FillResult {
+    // Orders filled (qty, price)
+    pub filled_orders: Vec<(u64, u64)>, 
+    pub remaining_qty: u64, 
+    pub status: OrderStatus, 
+}
+
+impl FillResult {
+    fn new() -> FillResult {
+        FillResult {
+            filled_orders: Vec::new(), 
+            remaining_qty: u64::MAX, 
+            status: OrderStatus::Uninitialized, 
+        }
+    }
+
+    pub fn avg_fill_price(&self) -> f32 {
+        let mut total_price_paid = 0;
+        let mut total_qty = 0;
+        for (q, p) in &self.filled_orders {
+            total_price_paid += p * q;
+            total_qty += q;
+        }
+        return total_price_paid as f32 / total_qty as f32;
+    }
 }
 
 #[derive(Debug)]
@@ -33,7 +62,7 @@ impl HalfBook {
         HalfBook {
             s, 
             price_map: BTreeMap::new(), 
-            price_levels: Vec::with_capacity(50_000), // Pre-alloc
+            price_levels: Vec::with_capacity(5000), // Pre-alloc
         }
     }
 
@@ -64,7 +93,7 @@ impl OrderBook {
             best_bid_price: u64::MIN, 
             bid_book: HalfBook::new(Side::Bid), 
             ask_book: HalfBook::new(Side::Ask), 
-            order_loc: HashMap::with_capacity(50_000), 
+            order_loc: HashMap::with_capacity(5000), 
         }
     }
 
@@ -122,10 +151,139 @@ impl OrderBook {
             }
         }
     }
+
+    pub fn add_limit_order(&mut self, s: Side, price: u64, order_qty: u64) -> FillResult {
+        fn match_at_price_level(
+            price_level: &mut VecDeque<Order>, 
+            incoming_order_qty: &mut u64, 
+            order_loc: &mut HashMap<String, (Side, usize)>,
+        ) -> u64 {
+            let mut done_qty = 0;
+            for o in price_level.iter_mut() {
+                if o.qty <= *incoming_order_qty {
+                    done_qty += o.qty;
+                    *incoming_order_qty -= o.qty;
+                    o.qty = 0;
+                    order_loc.remove(&o.order_id);
+                } else {
+                    o.qty -= *incoming_order_qty;
+                    done_qty += *incoming_order_qty;
+                    *incoming_order_qty = 0;
+                }
+            }
+
+            price_level.retain(|x| x.qty != 0);
+            done_qty
+        }
+
+        let mut remaining_order_qty = order_qty;
+        print!("Got order with qty {}, at price {}\n", remaining_order_qty, price);
+
+        let mut fill_result = FillResult::new();
+        match s {
+            Side::Bid => {
+                let askbook = &mut self.ask_book;
+                let price_map = &mut askbook.price_map;
+                let price_levels = &mut askbook.price_levels;
+                let mut price_map_iter = price_map.iter();
+
+                if let Some((mut x, _)) = price_map_iter.next() {
+                    while price >= *x {
+                        let curr_level = price_map[x];
+                        let matched_qty = match_at_price_level(
+                            &mut price_levels[curr_level],
+                            &mut remaining_order_qty,
+                            &mut self.order_loc,
+                        );
+
+                        if matched_qty != 0 {
+                            print!("Matched {} qty at price {}", matched_qty, x);
+                            fill_result.filled_orders.push((matched_qty, *x));
+                        }
+
+                        if let Some((a, _)) = price_map_iter.next() {
+                            x = a;
+                        } else {
+                            break;
+                        }
+                    }
+                }
+            }
+
+            Side::Ask => {
+                let bidbook = &mut self.bid_book;
+                let price_map = &mut bidbook.price_map;
+                let price_levels = &mut bidbook.price_levels;
+                let mut price_map_iter = price_map.iter();
+
+                if let Some((mut x, _)) = price_map_iter.next_back() {
+                    while price <= *x {
+                        let curr_level = price_map[x];
+                        let matched_qty = match_at_price_level(
+                            &mut price_levels[curr_level],
+                            &mut remaining_order_qty,
+                            &mut self.order_loc,
+                        );
+                        if matched_qty != 0 {
+                            print!("Matched {} qty at price {}", matched_qty, x);
+                            fill_result.filled_orders.push((matched_qty, *x));
+                        }
+                        if let Some((a, _)) = price_map_iter.next_back() {
+                            x = a;
+                        } else {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        fill_result.remaining_qty = remaining_order_qty;
+        if remaining_order_qty != 0 {
+            print!("Still remaining qty {} at price level {}\n", remaining_order_qty, price);
+            
+            if remaining_order_qty == order_qty {
+                fill_result.status = OrderStatus::Created;
+            } else {
+                fill_result.status = OrderStatus::PartiallyFilled;
+            }
+
+            self.create_new_limit_order(s, price, remaining_order_qty);
+
+        } else {
+            fill_result.status = OrderStatus::Filled;
+        }
+
+        self.update_bbo();
+
+        fill_result
+    }
+
+    pub fn get_bbo(&self) {
+        let total_bid_qty = self.bid_book.get_total_qty(self.best_bid_price);
+        let total_ask_qty = self.ask_book.get_total_qty(self.best_ask_price);
+
+        println!("Best bid {}, qty {}", self.best_bid_price, total_bid_qty);
+        println!("Best ask {}, qty {}", self.best_ask_price, total_ask_qty);
+        println!(
+            "Spread is {:.6},",
+            (self.best_ask_price - self.best_bid_price) as f32
+        );
+    }
+
 }
 
 
 
 fn main() {
-    println!("Hello, world!");
+    println!("Creating new Orderbook");
+    let mut orderbook = OrderBook::new("AAPL".to_string());
+    let mut rng = rand::thread_rng();
+    for _ in 1..500 {
+        orderbook.add_limit_order(Side::Bid, rng.gen_range(1..250), rng.gen_range(1..=500));
+        orderbook.add_limit_order(Side::Ask, rng.gen_range(250..500), rng.gen_range(1..=500));
+    }
+    println!("Done!");
+    orderbook.get_bbo();
+    dbg!(orderbook);
 }
